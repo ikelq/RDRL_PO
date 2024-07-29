@@ -102,23 +102,78 @@ class grid_case:
         #
         # np.save('two'+str(self.n_bus)+'load', self.load_pu)
         # np.save( 'two'+str(self.n_bus) + 'gen', self.gene_pu)
-
-        
-        # self.load_pu = self.load_pu[:, np.newaxis] * np.ones_like(self.init_load_p_mw)[np.newaxis, :]
-        # self.load_pu = self.load_pu * np.random.uniform(low=0.8, high=1.2, size=self.load_pu.shape)
-        # #
-        # self.gene_pu = self.gene_pu[:, np.newaxis] * np.ones_like(self.id_iber)[np.newaxis, :]
-        # self.gene_pu = self.gene_pu * np.random.uniform(low=0.8, high=1.2, size=self.gene_pu.shape)
-        #
-        # #
-
-        # if env_name == 118:
-        # #     low = 
-        # self.load_pu = np.random.uniform(low=0.5, high=1.5, size=[110000,self.init_load_p_mw.size])
-        # self.gene_pu = np.random.uniform(low=1, high=2, size=[110000,len(self.id_iber)])
-        # np.save('two'+str(self.n_bus)+'load15', self.load_pu)
-        # np.save( 'two'+str(self.n_bus) + 'gen15', self.gene_pu)
-
         self.load_pu = np.load('two'+str(self.n_bus)+'load15.npy')
         self.gene_pu = np.load('two'+str(self.n_bus) + 'gen15.npy')
 
+
+    def action_clip(self, action: np.ndarray) -> np.ndarray:
+        """Change the range (-1, 1) to (low, high)."""
+
+        low = np.array(self.model.sgen.min_q_mvar)
+        high = np.array(self.model.sgen.max_q_mvar)
+        # low = - np.array([2.6, 2.6, 2.6, 2.6, 0, 0])
+        # high =  np.array([2.6, 2.6, 2.6, 2.6, 3.5, 3.5])
+
+        scale_factor = (high - low) / 2
+        reloc_factor = high - scale_factor
+
+        action = action * scale_factor + reloc_factor
+        action = np.clip(action, low, high)
+
+        return action
+
+    def step_model(self,
+             action: np.ndarray,
+             ):
+        
+        reward_pst = self.model.res_bus.p_mw[0]
+
+        self.step_n = self.step_n + 1
+        action = self.action_clip(action)
+        self.model.sgen.q_mvar = action
+        self.model.load.p_mw = self.load_pu[self.step_n-1] * self.init_load_p_mw
+        self.model.load.q_mvar = self.load_pu[self.step_n-1] * self.init_load_q_mvar
+        self.model.sgen.p_mw[:len(self.id_iber)] = self.gene_pu[self.step_n-1]
+        #
+        # self.model.line.r_ohm_per_km = self.init_line_r_ohm_per_km*(1+0.2*(np.random.rand(1)-0.5))
+        # self.model.line.x_ohm_per_km = self.init_line_x_ohm_per_km*(1+0.2*(np.random.rand(1)-0.5))
+
+        pp.runpp(self.model, algorithm='bfsw')
+        violation_M = Relu(self.model.res_bus.vm_pu[self.id_iber+self.id_svc] - 1.05).sum()
+        violation_N = Relu(0.95-self.model.res_bus.vm_pu[self.id_iber+self.id_svc]).sum()
+        grid_loss = -self.model.res_line.pl_mw.sum()
+        # grid_loss1 = self.model.res_bus.p_mw.sum()
+
+        reward_p = self.model.res_bus.p_mw[0]
+        # reward_p = self.model.res_bus.p_mw[[0]+self.id_iber+self.id_svc].sum()
+        reward_v = -  violation_M - violation_N
+        reward = np.array((reward_p, reward_v))
+
+        violation = 0
+        if (1 * (self.model.res_bus.vm_pu > 1.05).sum() + 1 * (self.model.res_bus.vm_pu < 0.95).sum()) > 0:
+            violation = 1
+
+        next_state = np.hstack((np.array(self.model.res_bus.vm_pu[[0]+self.id_iber + self.id_svc]),
+                                np.array(self.model.res_ext_grid.iloc[0]),
+                                np.array(self.model.res_line.i_from_ka.iloc[self.id_line_f_bus]),action))
+        voltage_M = Relu(self.model.res_bus.vm_pu - 1.05).sum()
+        voltage_N = Relu(0.95-self.model.res_bus.vm_pu).sum()
+
+        #         new disturbance
+        self.model.load.p_mw = self.load_pu[self.step_n] * self.init_load_p_mw
+        self.model.load.q_mvar = self.load_pu[self.step_n] * self.init_load_q_mvar
+        self.model.sgen.q_mvar = action
+        self.model.sgen.p_mw[:len(self.id_iber)] = self.gene_pu[self.step_n]
+        pp.runpp(self.model, algorithm='bfsw')
+
+        new_state = np.hstack((np.array(self.model.res_bus.vm_pu[[0]+self.id_iber + self.id_svc]),
+                               np.array(self.model.res_ext_grid.iloc[0]),
+                               np.array(self.model.res_line.i_from_ka.iloc[self.id_line_f_bus]),action))
+
+        return next_state, reward, self.done, violation, violation_M, violation_N, voltage_M, voltage_N, grid_loss, new_state, reward_pst
+
+
+
+    def reset(self):
+        self.done = False
+        return self.observation_space

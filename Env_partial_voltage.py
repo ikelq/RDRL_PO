@@ -126,8 +126,8 @@ class grid_case:
         # self.model.line.x_ohm_per_km = self.init_line_x_ohm_per_km*(1+0.2*(np.random.rand(1)-0.5))
 
         pp.runpp(self.model, algorithm='bfsw')
-        violation_M = Relu(self.model.res_bus.vm_pu - 1.05).sum()
-        violation_N = Relu(0.95-self.model.res_bus.vm_pu).sum()
+        violation_M = Relu(self.model.res_bus.vm_pu[self.id_iber+self.id_svc] - 1.05).sum()
+        violation_N = Relu(0.95-self.model.res_bus.vm_pu[self.id_iber+self.id_svc]).sum()
         grid_loss = -self.model.res_line.pl_mw.sum()
         # grid_loss1 = self.model.res_bus.p_mw.sum()
 

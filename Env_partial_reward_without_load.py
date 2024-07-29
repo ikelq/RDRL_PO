@@ -49,16 +49,14 @@ class grid_case:
 
         # 1.32
         for i in self.id_iber:
-            pp.create_sgen(self.model, bus=i, p_mw=0, q_mvar=0, name='IBVR', scaling=1.0, in_service=True,
+            pp.create_sgen(self.model, bus=i, p_mw=0, q_mvar=0, name='IBER', scaling=1.0, in_service=True,
                            max_p_mw=4, min_p_mw=0, max_q_mvar=iber_re_capacity, min_q_mvar=-iber_re_capacity, controllable=True)
         for i in self.id_svc:
             pp.create_sgen(self.model, bus=i, p_mw=0, q_mvar=0, name='SVC', scaling=1.0, in_service=True,
                            max_p_mw=0, min_p_mw=0, max_q_mvar=id_svc_capacity, min_q_mvar=0, controllable=True)
 
         pp.runpp(self.model, algorithm='bfsw')
-        self.observation_space = copy.deepcopy(np.hstack((np.array(self.model.res_bus.vm_pu),  np.array(self.model.res_ext_grid.iloc[0]),
-                                                          np.array(self.model.res_load.p_mw), np.array(self.model.res_load.q_mvar),
-                                                          np.array(self.model.res_sgen.p_mw), np.array(self.model.res_sgen.q_mvar))))
+        self.observation_space = copy.deepcopy(np.hstack((np.array(self.model.res_bus.vm_pu), np.array(self.model.res_ext_grid.iloc[0,0]), np.array(self.model.res_sgen.q_mvar))))
 
         # self.id_Gp = self.id_iber
         # self.id_Gp = [x-1 for x in self.id_Gp]
@@ -96,6 +94,7 @@ class grid_case:
         self.load_pu = np.load('two'+str(self.n_bus)+'load15.npy')
         self.gene_pu = np.load('two'+str(self.n_bus) + 'gen15.npy')
 
+
     def action_clip(self, action: np.ndarray) -> np.ndarray:
         """Change the range (-1, 1) to (low, high)."""
 
@@ -115,6 +114,9 @@ class grid_case:
     def step_model(self,
              action: np.ndarray,
              ):
+        
+        reward_pst = self.model.res_bus.p_mw[0]
+
         self.step_n = self.step_n + 1
         action = self.action_clip(action)
         self.model.sgen.q_mvar = action
@@ -126,13 +128,13 @@ class grid_case:
         # self.model.line.x_ohm_per_km = self.init_line_x_ohm_per_km*(1+0.2*(np.random.rand(1)-0.5))
 
         pp.runpp(self.model, algorithm='bfsw')
-        violation_M = Relu(self.model.res_bus.vm_pu - 1.05).sum()
-        violation_N = Relu(0.95-self.model.res_bus.vm_pu).sum()
+        violation_M = Relu(self.model.res_bus.vm_pu[self.id_iber+self.id_svc] - 1.05).sum()
+        violation_N = Relu(0.95-self.model.res_bus.vm_pu[self.id_iber+self.id_svc]).sum()
         grid_loss = -self.model.res_line.pl_mw.sum()
         # grid_loss1 = self.model.res_bus.p_mw.sum()
 
-        # reward_p = self.model.res_bus.p_mw[0]
-        reward_p = grid_loss
+        reward_p = self.model.res_bus.p_mw[0]
+        # reward_p = grid_loss
         reward_v = -  violation_M - violation_N
         reward = np.array((reward_p, reward_v))
 
@@ -140,9 +142,7 @@ class grid_case:
         if (1 * (self.model.res_bus.vm_pu > 1.05).sum() + 1 * (self.model.res_bus.vm_pu < 0.95).sum()) > 0:
             violation = 1
 
-        next_state = np.hstack((np.array(self.model.res_bus.vm_pu),  np.array(self.model.res_ext_grid.iloc[0]),
-                                np.array(self.model.res_load.p_mw),np.array(self.model.res_load.q_mvar),
-                                np.array(self.model.res_sgen.p_mw),action))
+        next_state = np.hstack((np.array(self.model.res_bus.vm_pu), np.array(self.model.res_ext_grid.iloc[0,0]),action))
 
         voltage_M = Relu(self.model.res_bus.vm_pu - 1.05).sum()
         voltage_N = Relu(0.95-self.model.res_bus.vm_pu).sum()
@@ -154,11 +154,9 @@ class grid_case:
         self.model.sgen.p_mw[:len(self.id_iber)] = self.gene_pu[self.step_n]
         pp.runpp(self.model, algorithm='bfsw')
 
-        new_state = np.hstack((np.array(self.model.res_bus.vm_pu),  np.array(self.model.res_ext_grid.iloc[0]),
-                               np.array(self.model.res_load.p_mw),np.array(self.model.res_load.q_mvar),
-                               np.array(self.model.res_sgen.p_mw),action))
+        new_state = np.hstack((np.array(self.model.res_bus.vm_pu), np.array(self.model.res_ext_grid.iloc[0,0]),action))
 
-        return next_state, reward, self.done, violation, violation_M, violation_N, voltage_M, voltage_N, grid_loss, new_state
+        return next_state, reward, self.done, violation, violation_M, violation_N, voltage_M, voltage_N, grid_loss, new_state, reward_pst
 
 
 

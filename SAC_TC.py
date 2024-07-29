@@ -1,11 +1,3 @@
-# the ieee 33 bus system has been stalled with 3 IB-ERs
-# change the position of those IB-ER to show a clear simulation results   
-# generating the loading data
-# run 118 with penality cofficient 50 for voltage violation 
-# correct the state, include the PQ of slack bus for all environment
-# not use sam optimizator
-
-# add reactive power into state
 
 import copy
 import random
@@ -21,10 +13,7 @@ import pandapower as pp
 from pandas.core.frame import DataFrame
 from torch.distributions import Normal
 import pandas as pd
-import argparse
-# from sam import SAM
-import datetime
-
+import Env
 from IPython.display import clear_output
 
 if torch.backends.cudnn.enabled:
@@ -36,11 +25,9 @@ torch.manual_seed(seed)
 np.random.seed(seed)
 random.seed(seed)
 
+
 def Relu(x: np.ndarray):
     return np.maximum(0, x)
-
-def huber(x, k=100.0):
-    return torch.where(x.abs() < k, 0.5 * x.pow(2), k * (x.abs() - 0.5 * k))
 
 class ReplayBuffer:
     """A simple numpy replay buffer."""
@@ -74,7 +61,7 @@ class ReplayBuffer:
 
     def sample_batch(self) -> Dict[str, np.ndarray]:
         """Randomly sample a batch of experiences from memory."""
-        idxs = np.random.choice(self.size-decay, size=self.batch_size, replace=False)
+        idxs = np.random.choice(self.size, size=self.batch_size, replace=False)
         return dict(obs=self.obs_buf[idxs],
                     next_obs=self.next_obs_buf[idxs],
                     acts=self.acts_buf[idxs],
@@ -109,6 +96,7 @@ class GaussianNoise:
         )
         return np.random.normal(0, sigma, size=self.action_dim)
 
+
 def init_layer_uniform(layer: nn.Linear, init_w: float = 3e-3) -> nn.Linear:
     """Init uniform parameters on the single layer."""
     layer.weight.data.uniform_(-init_w, init_w)
@@ -135,8 +123,6 @@ class Actor(nn.Module):
         # set the hidden layers
         self.hidden1 = nn.Linear(in_dim, n_layer[0])
         self.hidden2 = nn.Linear(n_layer[0], n_layer[1])
-        self.hidden1e = nn.Linear(in_dim, n_layer[0])
-        self.hidden2e = nn.Linear(n_layer[0], n_layer[1])
         # self.hidden3 = nn.Linear(n_layer[1], n_layer[2])
 
         # set log_std layer
@@ -151,18 +137,16 @@ class Actor(nn.Module):
         """Forward method implementation."""
         x = F.relu(self.hidden1(state))
         x = F.relu(self.hidden2(x))
-        xe = F.relu(self.hidden1e(state))
-        xe = F.relu(self.hidden2e(xe))
         # x = F.relu(self.hidden3(x))
 
         # get mean
         mu = self.mu_layer(x).tanh()
 
         # get std
-        log_std = self.log_std_layer(xe).tanh()
+        log_std = self.log_std_layer(x).tanh()
         log_std = self.log_std_min + 0.5 * (
                 self.log_std_max - self.log_std_min
-        ) * (log_std + 1)
+        ) * (log_std+1)
         std = torch.exp(log_std)
 
         # sample actions
@@ -176,6 +160,7 @@ class Actor(nn.Module):
         log_prob = log_prob.sum(-1, keepdim=True)
 
         return action, log_prob, mu.tanh()
+
 
 class CriticQ(nn.Module):
     def __init__(self,
@@ -214,11 +199,9 @@ class SACAgent:
             initial_random_steps: int = 1e4,
             policy_update_freq: int = 1,
             seed: int = 777,
-            env_name=33,
-            partial=0,
+            env_name=33
     ):
         """Initialize."""
-        self.partial = partial
         obs_dim = env.observation_space.shape[0]
         self.action_dim = env.action_space.shape[0]
 
@@ -256,13 +239,23 @@ class SACAgent:
         self.qf_target2 = CriticQ(obs_dim + self.action_dim).to(self.device)
         self.qf_target2.load_state_dict(self.qf_2.state_dict())
 
+        # q v function
+        self.qv_1 = CriticQ(obs_dim + self.action_dim).to(self.device)
+        self.qv_target1 = CriticQ(obs_dim + self.action_dim).to(self.device)
+        self.qv_target1.load_state_dict(self.qv_1.state_dict())
+
+        self.qv_2 = CriticQ(obs_dim + self.action_dim).to(self.device)
+        self.qv_target2 = CriticQ(obs_dim + self.action_dim).to(self.device)
+        self.qv_target2.load_state_dict(self.qv_2.state_dict())
+
+
         # optimizers
         self.actor_optimizer = optim.Adam(self.actor.parameters(), lr=1e-4)
-        self.qf_1_optimizer = optim.Adam(self.qf_1.parameters(), lr=1e-4)
-        self.qf_2_optimizer = optim.Adam(self.qf_2.parameters(), lr=1e-4)
+        self.qf_1_optimizer = optim.Adam(self.qf_1.parameters(), lr=3e-4)
+        self.qf_2_optimizer = optim.Adam(self.qf_2.parameters(), lr=3e-4)
 
-        # self.qf_1_optimizer = SAM(self.qf_1.parameters(), torch.optim.Adam, lr=3e-4, adaptive=True)
-        # self.qf_2_optimizer = SAM(self.qf_2.parameters(), torch.optim.Adam, lr=3e-4, adaptive=True)
+        self.qv_1_optimizer = optim.Adam(self.qv_1.parameters(), lr=3e-4)
+        self.qv_2_optimizer = optim.Adam(self.qv_2.parameters(), lr=3e-4)
 
         # transition to store in memory
         self.transition = list()
@@ -277,13 +270,12 @@ class SACAgent:
 
         self.state = self.env.reset()
 
-
     def select_action(self, state: np.ndarray) -> np.ndarray:
         """Select an action from the input state."""
         # if initial random action should be conducted
         if self.total_step < self.initial_random_steps and not self.is_test:
             # selected_action = self.env.action_space.sample()
-            selected_action = 0.2*np.random.randn(self.action_dim)
+            selected_action = np.random.randn(self.action_dim)
             selected_actiont = selected_action
         else:
             selected_action = self.actor(
@@ -301,12 +293,12 @@ class SACAgent:
         return selected_action, selected_actiont
 
 
-    # def step_model(self, action: np.ndarray) -> Tuple[np.ndarray, np.float64, bool]:
-    #     """Take an action and return the response of the env."""
-    #     next_state, reward, done, violation, violation_M, violation_N, voltage_M, voltage_N, grid_loss, new_state = self.env.step_model(action)
-    #     return next_state, reward, done, violation, violation_M, violation_N, voltage_M, voltage_N, grid_loss, new_state
+    def step_model(self, action: np.ndarray) -> Tuple[np.ndarray, np.float64, bool]:
+        """Take an action and return the response of the env."""
+        next_state, reward, done, violation, violation_M, violation_N, voltage_M, voltage_N, grid_loss, new_state = self.env.step_model(action)
+        return next_state, reward, done, violation, violation_M, violation_N, voltage_M, voltage_N, grid_loss, new_state
 
-    
+
     def update_model(self) -> Tuple[torch.Tensor, ...]:
         """Update the model by gradient descent."""
         device = self.device  # for shortening the following lines
@@ -317,8 +309,7 @@ class SACAgent:
         action = torch.FloatTensor(samples["acts"]).to(device)
         reward = torch.FloatTensor(samples["rews"]).to(device)
         done = torch.FloatTensor(samples["done"].reshape(-1, 1)).to(device)
-        # next_action, log_prob, _ = self.actor(next_state)
-        action_p, log_prob, _ = self.actor(state)
+        next_action, log_prob, _ = self.actor(next_state)
 
         # train alpha (dual problem)
         alpha_loss = (
@@ -333,30 +324,25 @@ class SACAgent:
 
         # q function loss
         mask = 1 - done
-        q_1_pred = self.qf_1(state, action)
-        q_2_pred = self.qf_2(state, action)
+        qp_1_pred = self.qf_1(state, action)
+        qp_2_pred = self.qf_2(state, action)
+        qv_1_pred = self.qv_1(state, action)
+        qv_2_pred = self.qv_2(state, action)
         # v_target = self.vf_target(next_state)
 
-        # q_pred = torch.min(self.qf_1(next_state, next_action), self.qf_2(next_state, next_action))
+        qp_pred_next = torch.min(self.qf_1(next_state, next_action), self.qf_2(next_state, next_action))
+        qv_pred_next = torch.min(self.qv_1(next_state, next_action), self.qv_2(next_state, next_action))
 
-        q1_target = reward[:, 0].reshape(-1, 1)
-        q2_target = penalty_cofficient*reward[:, 1].reshape(-1, 1)
+        qp_target = reward[:, 0].reshape(-1, 1) + self.gamma * mask * (qp_pred_next - 0.5*alpha * log_prob)
+        qv_target = reward[:, 1].reshape(-1, 1) + self.gamma * mask * (qv_pred_next - (0.5/50)*alpha * log_prob)
 
-        qf_1_loss = F.mse_loss(q_1_pred, q1_target.detach())
-        if qr:
-            # errors = q2_target.detach() - q_2_pred
-            # qf_2_loss = torch.max((0.05 - 1) * errors, 0.05 * errors).mean()
+        qf_1_loss = F.mse_loss(qp_1_pred, qp_target.detach())
+        qf_2_loss = F.mse_loss(qp_2_pred, qp_target.detach())
 
-            diff = q2_target.detach() - q_2_pred
-            # loss = huber(diff) * (0.05 - (diff.detach() < 0).float()).abs()
-            loss = diff.pow(2) * (0.2 - (diff.detach() < 0).float()).abs()
-            # loss = diff.abs() * (0.2 - (diff.detach() < 0).float()).abs()
-            #  x.pow(2)
-            qf_2_loss = loss.mean()
+        qv_1_loss = F.mse_loss(qv_1_pred, qv_target.detach())
+        qv_2_loss = F.mse_loss(qv_2_pred, qv_target.detach())
 
-        else:
-            qf_2_loss = F.mse_loss(q_2_pred, q2_target.detach())
-
+        # train Q functions
         self.qf_1_optimizer.zero_grad()
         qf_1_loss.backward()
         self.qf_1_optimizer.step()
@@ -365,22 +351,21 @@ class SACAgent:
         qf_2_loss.backward()
         self.qf_2_optimizer.step()
 
-        # qf_1_loss.backward()
-        # self.qf_1_optimizer.first_step(zero_grad=True)
-        # F.mse_loss(self.qf_1(state, action), q1_target.detach()).backward()
-        # self.qf_1_optimizer.second_step(zero_grad=True)
+        self.qv_1_optimizer.zero_grad()
+        qv_1_loss.backward()
+        self.qv_1_optimizer.step()
 
-        # qf_2_loss.backward()
-        # self.qf_2_optimizer.first_step(zero_grad=True)
-        # F.mse_loss(self.qf_2(state, action), q2_target.detach()).backward()
-        # self.qf_2_optimizer.second_step(zero_grad=True)
+        self.qv_2_optimizer.zero_grad()
+        qv_2_loss.backward()
+        self.qv_2_optimizer.step()
 
-        qf_loss = qf_1_loss + qf_2_loss
+        qf_loss = qf_1_loss + qf_2_loss + qv_1_loss + qv_2_loss
 
         if self.total_step % self.policy_update_freq == 0:
             # actor loss
-            # action_p, log_prob, _ = self.actor(state)
-            advantage = self.qf_1(state, action_p) + self.qf_2(state, action_p)
+            advantage = torch.min(self.qf_1(state, self.actor(state)[0]), self.qf_2(state, self.actor(state)[0]))\
+                        + 50*torch.min(self.qv_1(state, self.actor(state)[0]), self.qv_2(state, self.actor(state)[0]))
+            # advantage = q_pred
             actor_loss = (alpha * log_prob - advantage).mean()
 
             # train actor
@@ -389,19 +374,15 @@ class SACAgent:
             self.actor_optimizer.step()
 
             # target update (vf)
-            # self._target_soft_update()
+            self._target_soft_update()
         else:
             actor_loss = torch.zeros(1)
-
-        # train Q functions
-
         return actor_loss.detach().cpu().numpy(), qf_loss.detach().cpu().numpy(),  alpha_loss.detach().cpu().numpy()
 
     def train(self, num_frames: int, plotting_interval: int = 400):
         """Train the agent."""
         self.is_test = False
         actor_losses, qf_losses,  alpha_losses = [], [], []
-        decision_times, train_times = [], []
         scores = []
         violation_sum_s = []
         violation_sum_M_s = []
@@ -424,58 +405,43 @@ class SACAgent:
         violation_sum_Nt = 0
         grid_loss_sumt = 0
 
-        real_voltage_sum_M_st = []
-        real_voltage_sum_N_st = []
-        real_voltage_sum_Mt = 0
-        real_voltage_sum_Nt = 0
-
-        reward_5 = 0
+        # virtual interaction
+        violation_sum_s_virtual = []
+        violation_sum_M_s_virtual = []
+        violation_sum_N_s_virtual = []
+        grid_loss_sum_s_virtual = []
+        score_virtual = 0
+        violation_sum_virtual = 0
+        violation_sum_M_virtual = 0
+        violation_sum_N_virtual = 0
+        grid_loss_sum_virtual = 0
 
         for self.total_step in range(1, num_frames + 1):
+            action, action_0 = self.select_action(self.state)
 
-            while True:
-                try:
-                    start_time = datetime.datetime.now()
-                    action, action0 = self.select_action(self.state)
-                    end_time = datetime.datetime.now()
-                    decision_time = (end_time - start_time).total_seconds()
+            next_state, reward, done, violation, violation_M, violation_N, voltage_M, voltage_N, grid_loss, new_state = self.step_model(action)
+            self.env.step_n = self.env.step_n - 1
+            next_state1, reward1, done1, violation1, violation_M1, violation_N1, voltage_M, voltage_N, grid_loss1, new_state1 = self.step_model(action_0)
+            self.transition = [self.state, action, reward, next_state, done]
+            self.memory.store(*self.transition)
 
-                    next_state, reward, done, violation, violation_M, violation_N, voltage_M, voltage_N, grid_loss, new_state, reward_pst = self.env.step_model(action)
-                    self.env.step_n = self.env.step_n - 1
-                    next_state1, reward1, done1, violation1, violation_M1, violation_N1, voltage_M1, voltage_N1, grid_loss1, new_state1, _ = self.env.step_model(action0)
-                    reward[0] -= reward_pst
-                    self.transition = [self.state, action, reward, next_state, done]
-                    self.memory.store(*self.transition)
-                    break
-                except:
-                    print('except',self.env.step_n)
-
-            # if decay_average != 0:
-            #     reward_5 += reward
-            #     if self.env.step_n % decay_average == 0:
-            #         self.memory.store_1(reward_5/decay_average)
-            #         reward_5 = 0
-
-            if self.env.step_n > 140000:
+            if self.env.step_n > 96*390:
                 self.env.step_n = 0
             # state = next_state
             self.state = new_state
-            score += reward[0]+penalty_cofficient*reward[1]
+            score += reward.sum()
             violation_sum = violation_sum + violation
             violation_sum_M = violation_sum_M + violation_M
             violation_sum_N = violation_sum_N + violation_N
             grid_loss_sum = grid_loss_sum + grid_loss
 
-            scoret += reward1[0]+penalty_cofficient*reward1[1]
+            scoret += reward1.sum()
             violation_sumt = violation_sumt + violation1
             violation_sum_Mt = violation_sum_Mt + violation_M1
             violation_sum_Nt = violation_sum_Nt + violation_N1
             grid_loss_sumt = grid_loss_sumt + grid_loss1
 
-            real_voltage_sum_Mt = real_voltage_sum_Mt + voltage_M1
-            real_voltage_sum_Nt = real_voltage_sum_Nt + voltage_N1
-
-            if self.total_step % (1000) == 0:
+            if self.total_step % 96 == 0:
                 # state = env.reset()
                 scores.append(score)
                 violation_sum_s.append(violation_sum)
@@ -498,11 +464,6 @@ class SACAgent:
                 violation_sum_Mt = 0
                 violation_sum_Nt = 0
                 grid_loss_sumt = 0
-
-                real_voltage_sum_M_st.append(real_voltage_sum_Mt)
-                real_voltage_sum_N_st.append(real_voltage_sum_Nt)
-                real_voltage_sum_Mt = 0
-                real_voltage_sum_Nt = 0
 
             # if training is ready
             for i in range(4):
@@ -530,16 +491,6 @@ class SACAgent:
                     alpha_losses
                 )
 
-
-            train_end_time = datetime.datetime.now()
-            train_time = (train_end_time - start_time).total_seconds()
-
-            decision_times.append(decision_time)
-            train_times.append(train_time)
-
-
-
-
         data_tr = {"scores": scores,
                    "violation_sum_s": violation_sum_s,
                    "violation_sum_M_s": violation_sum_M_s,
@@ -547,41 +498,30 @@ class SACAgent:
                    "grid_loss_sum_s": grid_loss_sum_s
                    }
         data_train = DataFrame(data_tr)
-        data_train.to_csv('trainsac' + str(self.env.name) + str(self.seed) + str(self.partial) + 'tootsa'+str(qr)+str(decay)+str(decay_average)+'.csv')
+        data_train.to_csv('trainsac' + str(self.env.name) + str(self.seed) + str(self.gamma)+'tc.csv')
 
         data_tr_test = {"scorest": scorest,
                         "violation_sum_st": violation_sum_st,
                         "violation_sum_M_st": violation_sum_M_st,
                         "violation_sum_N_st": violation_sum_N_st,
-                        "grid_loss_sum_st": grid_loss_sum_st,
-                        "real_voltage_sum_M_st": real_voltage_sum_M_st,
-                        "real_voltage_sum_N_st": real_voltage_sum_N_st,
+                        "grid_loss_sum_st": grid_loss_sum_st
                         }
         data_train_test = DataFrame(data_tr_test)
-        data_train_test.to_csv('traintestsac' + str(self.env.name) + str(self.seed) + str(self.partial) + 'tootsa'+str(qr)+str(decay)+str(decay_average)+'.csv')
+        data_train_test.to_csv('traintestsac' + str(self.env.name) + str(self.seed) + str(self.gamma)+ 'tc.csv')
 
         data_tr_loss = {"actor_losses": actor_losses,
                         "qf_losses": qf_losses,
                         "alpha_losses": alpha_losses
                         }
         data_train_loss = DataFrame(data_tr_loss)
-        data_train_loss.to_csv('trainlosssac' + str(self.env.name) + str(self.seed) + str(self.partial) + 'tootsa'+str(qr)+str(decay)+str(decay_average)+'.csv')
+        data_train_loss.to_csv('trainlosssac' + str(self.env.name) + str(self.seed) + str(self.gamma)+ 'tc.csv')
 
-        data_time = {"decision_times": decision_times,
-                "train_times": train_times
-                }
-        data_time = DataFrame(data_time)
-        data_time.to_csv('data_time' + str(self.env.name) + str(self.seed) + str(self.partial) + 'tootsa'+str(qr)+str(decay)+str(decay_average)+'.csv')
-
-        #
         # torch.save(self.log_alpha, 'log_alpha_params' + 'sac'+'.pth')
         # torch.save(self.actor.state_dict(), 'actor_p_params' + 'sac' + '.pth')
         # torch.save(self.qf_1.state_dict(), 'critic1_p_params' + 'sac' + '.pth')
         # torch.save(self.qf_2.state_dict(), 'critic2_p_params' + 'sac' + '.pth')
         # torch.save(self.qf_target1.state_dict(), 'critic_target1_p_params' + 'sac' + '.pth')
         # torch.save(self.qf_target2.state_dict(), 'critic_target2_p_params' + 'sac' + '.pth')
-
-
 
     def test(self, test_frams):
         """Test the agent."""
@@ -615,6 +555,7 @@ class SACAgent:
         grid_loses_t = []
         actions= []
 
+
         while self.env.step_n < 96*390:
             action, _ = self.select_action(state)
             next_state, reward, done, violation, violation_M, violation_N, voltage_M, voltage_N, grid_loss,  new_state = self.step_model(action)
@@ -627,7 +568,7 @@ class SACAgent:
 
             # state = next_state
             state = new_state
-            score += reward[0]+penalty_cofficient*reward[1]
+            score += reward.sum()
             violation_sum = violation_sum + violation
             violation_sum_M = violation_sum_M + violation_M
             violation_sum_N = violation_sum_N + violation_N
@@ -672,7 +613,7 @@ class SACAgent:
                    }
 
         data_test = DataFrame(data_te)
-        data_test.to_csv('testsac'+str(self.env.name)+str(self.seed) +'tootsa.csv')
+        data_test.to_csv('testsac'+str(self.env.name)+str(self.seed) + str(self.gamma)+'tc.csv')
 
         data_te_step = {"violation_s_t": violation_s_t,
                    "violations_M_t": violations_M_t,
@@ -680,10 +621,10 @@ class SACAgent:
                    "grid_loses_t": grid_loses_t,
                    }
         data_test_step = DataFrame(data_te_step)
-        data_test_step.to_csv('testsac_step' +str(self.env.name) + str(self.seed) + 'tootsa.csv')
+        data_test_step.to_csv('testsac_step' +str(self.env.name) + str(self.seed) + str(self.gamma)+ 'tc.csv')
         data_test_step_action = DataFrame(actions)
         data_test_step_action.to_csv(
-            'testsac_step_action' + str(self.env.name) + str(self.seed) + 'tootsa.csv')
+            'testsac_step_action' + str(self.env.name) + str(self.seed) + str(self.gamma)+ 'tc.csv')
 
     def _target_soft_update(self):
         """Soft-update: target = tau*local + (1-tau)*target."""
@@ -699,6 +640,15 @@ class SACAgent:
             t_param.data.copy_(tau * l_param.data + (1.0 - tau) * t_param.data)
         for t_param, l_param in zip(
                 self.qf_target2.parameters(), self.qf_2.parameters()
+        ):
+            t_param.data.copy_(tau * l_param.data + (1.0 - tau) * t_param.data)
+
+        for t_param, l_param in zip(
+                self.qv_target1.parameters(), self.qv_1.parameters()
+        ):
+            t_param.data.copy_(tau * l_param.data + (1.0 - tau) * t_param.data)
+        for t_param, l_param in zip(
+                self.qv_target2.parameters(), self.qv_2.parameters()
         ):
             t_param.data.copy_(tau * l_param.data + (1.0 - tau) * t_param.data)
 
@@ -739,156 +689,54 @@ class SACAgent:
         plt.show()
 
 if __name__ == "__main__":
-
-    parser = argparse.ArgumentParser(description='manual to this script')
-    parser.add_argument("--partial", default=18, type=int) 
-    parser.add_argument("--qr", default=0, type=int) 
-    parser.add_argument("--env_name", default=33, type=int) 
-    args = parser.parse_args()
-
     load_pu = np.load('load96.npy')
     gene_pu = np.load('gen96.npy')
 
+    virtualinteraction = False
+    safepolicy = False
+
     # parameters
-    num_frames = 100000
-    # test_frames = 96*360
-    memory_size = 100000
+    num_frames = 96*300
+    test_frames = 96*360
+    memory_size = 30000
     batch_size = 128
-    initial_random_steps = 1000
-    decay = 0    # decay time for sampling data form data buffer
-    decay_average = 0   # eahc dacay_average_reward data have the same reward
+    initial_random_steps = 96*10
 
-    # partial = 1 : partial power loss; partial = 2 : partial power loss and voltage violation;
-    # partial = 3 : partial state power loss voltage violation   # partial = 4 : partial state #partial = 5 partial state, reduce loss
-    partial = args.partial
-    # qr = args.qr
-    env_name = args.env_name
-
-    if partial == 0:
-        import Env as Env
-    # if partial == 1:
-    #     import Env_partial_power_loss as Env
-    if partial == 2:
-        import Env_partial_voltage as Env
-        # torch.cuda.set_device(2)
-    if partial == 3:
-        import Env_partial_reward as Env
-        # torch.cuda.set_device(2)
-    # if partial == 4:
-    #     import Env_partial_state as Env
-    # if partial == 5:
-    #     import Env_partial_state_power_loss as Env
-    if partial == 6:
-        import Env_partial_state_voltage as Env
-        # torch.cuda.set_device(3)
-    if partial == 7:
-        import Env_partial_state_reward as Env
-        # torch.cuda.set_device(3)
-    # if partial == 8:
-    #     import Env_li as Env
-
-    if partial == 11:
-        import Env_partial_voltage_li as Env
-        # torch.cuda.set_device(4)
-
-    if partial == 12:
-        import Env_partial_reward_li as Env
-        # torch.cuda.set_device(4)
-    # if partial == 13:
-    #     import Env_partial_state_li as Env
-    if partial == 15:
-        import Env_partial_state_voltage_li as Env
-        # torch.cuda.set_device(5)
-    if partial == 16:
-        import Env_partial_state_reward_li as Env
-        # torch.cuda.set_device(5)
-
-    if partial == 17:
-        import Env_partial_voltage_without_load as Env
-        # torch.cuda.set_device(6)
-    if partial == 18:
-        import Env_partial_reward_without_load as Env
-        # torch.cuda.set_device(6)
-    if partial == 19:
-        import Env_partial_state_voltage_without_load as Env
-        # torch.cuda.set_device(1)
-    if partial == 20:
-        import Env_partial_state_reward_without_load as Env
-        # torch.cuda.set_device(1)
-
-    if partial == 21:
-        import Env_partial_voltage_li_np as Env
-        # torch.cuda.set_device(4)
-    if partial == 22:
-        import Env_partial_reward_li_np as Env
-        # torch.cuda.set_device(4)
-    if partial == 23:
-        import Env_partial_state_voltage_li_np as Env
-        # torch.cuda.set_device(5)
-    if partial == 24:
-        import Env_partial_state_reward_li_np as Env
-        # torch.cuda.set_device(5)
-
-    print(partial)
-    
-    for seed in [777]:
+    for seed in [555, 777, 999]:
         torch.manual_seed(seed)
         np.random.seed(seed)
         random.seed(seed)
-        for qr in [0,1]:
-            # for env_name in [33,69,118]:
-            print(env_name)
+
+        for env_name in [33, 69, 118]:
 
             if env_name == 69:
                 # ieee_model = pc.from_mpc('case69.mat', f_hz=50, casename_mpc_file='mpc', validate_conversion=False)
-                id_iber = [5, 22, 44, 63]
-                id_svc = [52]  #, 33
-                line_f_bus = [2,7,11,36]
-                penalty_cofficient = 50
-                id_svc_capacity = 2
-                iber_re_capacity = 3
+                id_iber = [5, 23, 44, 57]
+                id_svc = [13]  #, 33
             if env_name ==33:
                 # ieee_model = pc.from_mpc('case33_bw.mat', f_hz=50, casename_mpc_file='mpc', validate_conversion=False)
-                id_iber = [16, 31]
-                id_svc = [7]
-                line_f_bus = [2,5,10]
-                penalty_cofficient = 50
-                id_svc_capacity = 2
-                iber_re_capacity = 3
+                id_iber = [17, 21, 24]
+                id_svc = [32]
             if env_name == 118:
-                # id_iber = [33, 50, 53, 69, 76, 97, 106, 111]
-                # id_svc = [44, 104]
-                id_iber = [33, 44, 50, 53, 76, 97, 106, 111]
-                id_svc = [69, 84]
-                line_f_bus = [1,10,28,29,64,78,99]
-                penalty_cofficient = 50
-                id_svc_capacity = 2
-                iber_re_capacity = 3
+                id_iber = [33, 50, 53, 68, 74, 97, 107, 111]
+                id_svc = [44, 104]
             #
-            
-            env = Env.grid_case(env_name, load_pu, gene_pu, id_iber, id_svc, line_f_bus, iber_re_capacity,
-                id_svc_capacity)
-            
-            # partial = 1 : partial power loss; partial = 2 : partial power loss and voltage violation;
-            # partial = 3 : partial state power loss voltage violation   # partial = 4 : partial state #partial = 5 partial state, reduce loss
+            env = Env.grid_case(env_name, load_pu, gene_pu, id_iber, id_svc)
+
             agent = SACAgent(
                 env,
                 memory_size,
                 batch_size,
+                gamma=0.9,
                 initial_random_steps=initial_random_steps,
                 seed = seed,
-                env_name = env_name,
-                partial= partial
+                env_name = env_name
             )
 
-            agent.train(num_frames, plotting_interval=4000000)
-        # agent.test(test_frames)
+            agent.train(num_frames, plotting_interval=40000)
+            # agent.test(test_frames)
 
-#  python SAC_OSTC_sa_partial_1.py --partial 0 &
-#  python SAC_OSTC_sa_partial_1.py --partial 2 &
-#  python SAC_OSTC_sa_partial_1.py --partial 4 &
-#  python SAC_OSTC_sa_partial_1.py --partial 5 &
-#  python SAC_OSTC_sa_partial_1.py --partial 6 
+
     # f = open('agent.pkl', 'wb')
     # pickle.dump(agent, f)
     # f.close()
